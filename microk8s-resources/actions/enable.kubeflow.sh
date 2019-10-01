@@ -1,68 +1,154 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
 
-set -eu
-
-source $SNAP/actions/common/utils.sh
-
-
-CONTROLLER="uk8s"
-CLOUD="microk8s"
-MODEL="kubeflow"
-
-
-function print_message () {
-
-cat << EOF
-
-Congratulations, Kubeflow is now available.
-Run \`microk8s.kubectl proxy\` to be able to access the dashboard at
-
-    http://localhost:8001/api/v1/namespaces/kube-system/services/https:kubernetes-dashboard:/proxy/#!/overview?namespace=$MODEL
-
-The central dashboard is available at http://$1/
-To tear down Kubeflow and associated infrastructure, run this command:
-
-    microk8s.juju kill-controller $CONTROLLER --destroy-all-models --destroy-storage
-
-For more information, see documentation at:
-https://github.com/juju-solutions/bundle-kubeflow/blob/master/README.md
-
-EOF
-
-}
+import argparse
+import json
+import os
+import random
+import string
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
 
 
-function enable_addons () {
-  "$SNAP/microk8s-enable.wrapper" dns storage dashboard juju
-  for i in {1..5}
-  do
-    "$SNAP/microk8s-status.wrapper" --wait-ready --timeout 60 && break || sleep 10
-  done
-}
+def run(*args, die=True):
+    # Add wrappers to $PATH
+    env = os.environ.copy()
+    env["PATH"] += ":%s" % os.environ["SNAP"]
+
+    result = subprocess.run(
+        args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+
+    try:
+        result.check_returncode()
+    except subprocess.CalledProcessError as err:
+        if die:
+            if result.stderr:
+                print(result.stderr.decode("utf-8"))
+            print(err)
+            sys.exit(1)
+        else:
+            raise
+
+    return result.stdout.decode("utf-8")
 
 
-function bootstrap_and_deploy () {
-  "$SNAP/microk8s-juju.wrapper" bootstrap $CLOUD $CONTROLLER
-  "$SNAP/microk8s-juju.wrapper" add-model $MODEL $CLOUD
-  # Uncomment this line to present local disks into microk8s as Persistent Volumes
-  # microk8s.kubectl create -f storage/local-storage.yml || true
-  "$SNAP/microk8s-juju.wrapper" create-storage-pool operator-storage kubernetes storage-class=microk8s-hostpath
-  "$SNAP/microk8s-juju.wrapper" deploy kubeflow
-  # juju-wait is needed?
-  #"$SNAP/microk8s-juju.wrapper" wait -vw
-
-  # General Kubernetes setup
-  "$SNAP/microk8s-kubectl.wrapper" create -n $MODEL -f "${SNAP}/actions/kubeflow" || true
-
-  "$SNAP/microk8s-juju.wrapper" config ambassador juju-external-hostname=localhost
-  "$SNAP/microk8s-juju.wrapper" expose ambassador
-}
+def get_random_pass():
+    return "".join(
+        random.choice(string.ascii_uppercase + string.digits) for _ in range(30)
+    )
 
 
-echo "Installing Kubeflow"
-echo "Enabling required add-ons."
-enable_addons
-echo "Bootstraping and deploying kubeflow components."
-bootstrap_and_deploy
-AMBASSADOR_IP=$("$SNAP/microk8s-juju.wrapper" status | grep "ambassador " | awk '{print $8}')
-print_message ${AMBASSADOR_IP}
+def main():
+    # Get rid of empty `''` argument if nothing was passed in by enable wrapper
+    sys.argv = [a for a in sys.argv if a]
+
+    parser = argparse.ArgumentParser(description="Enable kubeflow in microk8s.")
+    parser.add_argument("--controller", default="uk8s", help="Juju controller name")
+    parser.add_argument(
+        "--model", default="kubeflow", help="Juju model name / Kubernetes namespace"
+    )
+    parser.add_argument("--channel", default="stable", help="Kubeflow channel")
+    args = parser.parse_args()
+
+    try:
+        password = os.environ["KUBEFLOW_AUTH_PASSWORD"]
+    except KeyError:
+        password = get_random_pass()
+
+    password_overlay = {
+        "applications": {
+            "ambassador-auth": {"options": {"password": password}},
+            "katib-db": {"options": {"root-password": get_random_pass()}},
+            "mariadb": {"options": {"root-password": get_random_pass()}},
+            "pipelines-api": {"options": {"minio-secret-key": "minio123"}},
+        }
+    }
+
+    for service in ["dns", "storage", "dashboard", "juju"]:
+        print("Enabling %s..." % service)
+        run("microk8s-enable.wrapper", service)
+
+        for _ in range(12):
+            try:
+                run("microk8s-status.wrapper", "--wait-ready", die=False)
+                break
+            except subprocess.CalledProcessError:
+                print("Waiting for %s to become ready..." % service)
+                time.sleep(5)
+        else:
+            print("\033[91mWaited too long for %s to become ready!\033[0m" % service)
+            sys.exit(1)
+
+    controllers = json.loads(
+        run("microk8s-juju.wrapper", "list-controllers", "--format=json")
+    )
+
+    if args.controller in (controllers["controllers"] or {}):
+        print(
+            "The controller %s already exists. Run `microk8s.disable kubeflow` to remove it."
+            % args.controller
+        )
+        sys.exit(1)
+
+    print("Deploying Kubeflow...")
+    run("microk8s-juju.wrapper", "bootstrap", "microk8s", args.controller)
+    run("microk8s-juju.wrapper", "add-model", args.model, "microk8s")
+    cluster_roles = "https://raw.githubusercontent.com/juju-solutions/bundle-kubeflow/pod-spec-set-v2/resources/cluster-roles.yaml"
+    run("microk8s-kubectl.wrapper", "apply", "-n", args.model, "-f", cluster_roles)
+
+    with tempfile.NamedTemporaryFile("w+") as f:
+        json.dump(password_overlay, f)
+        f.flush()
+
+        run(
+            "microk8s-juju.wrapper",
+            "deploy",
+            "kubeflow",
+            "--channel",
+            args.channel,
+            "--overlay",
+            f.name,
+        )
+
+    run(
+        "microk8s-juju.wrapper",
+        "config",
+        "ambassador",
+        "juju-external-hostname=localhost",
+    )
+
+    status = run(
+        "microk8s-juju.wrapper",
+        "status",
+        "-m",
+        "%s:%s" % (args.controller, args.model),
+        "--format=json",
+    )
+    status = json.loads(status)
+    ambassador_ip = status["applications"]["ambassador"]["units"]["ambassador/0"][
+        "address"
+    ]
+
+    print(
+        textwrap.dedent(
+            """
+    Congratulations, Kubeflow is now available.
+    The dashboard is available at http://%s/
+    To tear down Kubeflow and associated infrastructure, run:
+
+       microk8s.disable kubeflow
+    """
+            % ambassador_ip
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
