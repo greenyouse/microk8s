@@ -23,7 +23,7 @@ echo "Enabling Linkerd2"
 # temporary fix while we wait for linkerd to support v1.16
 refresh_opt_in_config "runtime-config" "api/all=true" kube-apiserver
 echo "Restarting the API server."
-sudo systemctl restart snap.${SNAP_NAME}.daemon-apiserver
+sudo snapctl restart ${SNAP_NAME}.daemon-apiserver
 sleep 5
 ${SNAP}/microk8s-status.wrapper --wait-ready --timeout 30 >/dev/null
 

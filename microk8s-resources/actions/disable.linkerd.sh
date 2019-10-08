@@ -14,7 +14,7 @@ sudo rm -f "$SNAP_DATA/bin/linkerd"
 # temporary fix while we wait for linkerd to support v1.16
 skip_opt_in_config "runtime-config" kube-apiserver
 echo "Restarting the API server."
-sudo systemctl restart snap.${SNAP_NAME}.daemon-apiserver
+sudo snapctl restart ${SNAP_NAME}.daemon-apiserver
 sleep 5
 ${SNAP}/microk8s-status.wrapper --wait-ready --timeout 30 >/dev/null
 
