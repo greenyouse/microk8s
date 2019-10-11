@@ -15,11 +15,23 @@ sleep 5
 n=0
 until [ $n -ge 10 ]
 do
-  test -e "$SNAP_DATA/args/flannel-network-mgr-config" && "$SNAP_DATA/args/flanneld" && break
+  test -e "$SNAP_DATA/args/flannel-network-mgr-config" && test -e "$SNAP_DATA/args/flanneld" && break
   echo "Waiting for flannled configuration to appear. (attempt $n)"
   n=$[$n+1]
   sleep 2
 done
+
+if ! [ -e "$SNAP_DATA/var/lock/flanneld-ready" ]
+then
+  for link in cni0 cilium_vxlan
+  do
+    if $SNAP/sbin/ip link show ${link}
+    then
+      $SNAP/sbin/ip link delete ${link}
+    fi
+  done
+  touch $SNAP_DATA/var/lock/flanneld-ready
+fi
 
 # TODO rewrite for snaps
 etcd_endpoints="$(cat $SNAP_DATA/args/flanneld | grep "etcd-endpoints" | tr "=" " "| awk '{print $2}')"
